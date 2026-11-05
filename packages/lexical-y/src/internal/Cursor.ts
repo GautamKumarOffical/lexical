@@ -427,7 +427,7 @@ export class Cursor {
   private step: ((formats: Formats, it: Item, f: FoldIn) => void) | null = null;
   /**
    * Whether opener `it` is paired as the editor shows it: an end the hold
-   * holds back pairs nothing (see Ident.withHeldView).
+   * holds back pairs nothing (see Reader#held).
    */
   private pairedShown(it: Item): boolean {
     return isPaired(it, this.shownFold());
@@ -457,7 +457,7 @@ export class Cursor {
 
   /**
    * Step format item `it` into `formats` as the editor shows it: an end the
-   * hold holds back pairs nothing (see Ident.withHeldView). The cursor walks
+   * hold holds back pairs nothing (see Reader#held). The cursor walks
    * what the editor shows (held formats are passed over, see isHeldFormat).
    */
   private stepShown(formats: Formats, it: Item): void {
