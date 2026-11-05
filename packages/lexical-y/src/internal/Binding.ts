@@ -6076,6 +6076,30 @@ export class YBinding {
       dirtyElements,
       dirtyLeaves,
     );
+    if (written === 'held') {
+      // Refused before it changed anything (see Writer#$endangersHeld): the
+      // editor reads the document again, the local change undone, and the
+      // hold ends, so the editor shows the collaborator's text. The binding
+      // stays active.
+      this.writeCursor = null;
+      this.warn(
+        UNSUPPORTED_EDIT_WARNING,
+        'a local change was not written: it would delete or leave behind text a collaborator wrote in the line being composed, which the composition holds back; the editor reads the document again',
+        {reason: 'held-composition'},
+      );
+      this.$refuseChanged(
+        dirtyElements,
+        dirtyLeaves,
+        editorState,
+        prevEditorState,
+        this.refused,
+      );
+      this.pending.add('reread');
+      if (state.hidden !== null) {
+        state.hidden.missed = true;
+      }
+      return;
+    }
     if (written instanceof Refusal) {
       // The layout record changed inside the write's own transaction: the
       // change is refused as on a read-only binding (read again once it can
@@ -6364,12 +6388,13 @@ export class YBinding {
     prevEditorState: EditorState,
     dirtyElements: Map<NodeKey, boolean>,
     dirtyLeaves: Set<NodeKey>,
-  ): Writer | null | Refusal {
+  ): Writer | null | Refusal | 'held' {
     let writer: Writer | null = null;
     // Inside an app's outer transaction that restored ends (an undo in it):
     // repair the copies before anything reads pairing (see Ident).
     repairPendingCopies(this._doc);
     let refused: 'layout' | 'schema' | null = null;
+    let heldRefused = false;
     // Admitted once, for the whole write: its pins and its recovery too,
     // which see the records as this write left them (`after`).
     const grace = this.writeGrace;
@@ -6400,12 +6425,21 @@ export class YBinding {
             this.seer,
           );
           writer.followUp = commit.followUp;
+          // What a composition holds back is never deleted by a write in a
+          // shape the writer cannot carry it through (see
+          // Writer#$endangersHeld): such a write is refused before it
+          // changes anything.
+          if (writer.$endangersHeld()) {
+            heldRefused = true;
+            return;
+          }
           writer.$run();
         } finally {
           // A local edit (not a follow-up, which is no one's edit) carries
           // this client's schema version, and so does an app edit written
-          // out of the undo history (recordOwnSchema).
-          if (origin === this || commit.recordOwnSchema) {
+          // out of the undo history (recordOwnSchema); a write refused for
+          // what a composition holds back writes nothing.
+          if (!heldRefused && (origin === this || commit.recordOwnSchema)) {
             recordSchema(this._root, this.options.schemaVersion, tr, t =>
               this.isUnderRoot(t),
             );
@@ -6428,6 +6462,9 @@ export class YBinding {
       const refusedBy = refused as 'layout' | 'schema' | null;
       if (refusedBy !== null) {
         return new Refusal(refusedBy);
+      }
+      if (heldRefused) {
+        return 'held';
       }
       if (!commit.followUp) {
         this._doc.transact(tr => {

@@ -13,6 +13,7 @@ import {
   ContentFormat,
   ContentString,
   ContentType,
+  findIndexSS,
   Item,
   iterateStructsByIdSet,
   Node as YNode,
@@ -22,6 +23,7 @@ import {
   $getNodeByKey,
   $getSelection,
   $isElementNode,
+  $isLineBreakNode,
   $isParagraphNode,
   $isRangeSelection,
   $isTextNode,
@@ -809,6 +811,7 @@ export class Writer {
       }
     }
     this.unmapDeleted();
+    this.checkHeldKept();
   }
 
   /**
@@ -4915,6 +4918,240 @@ export class Writer {
    * that one stored that this editor does not own (see ownsNodeAttr) go
    * into the new one.
    */
+  /**
+   * Before the write runs, while a composition's hold is on: whether it
+   * would store anew, delete, move or replace a shared node around what the
+   * hold keeps back (the inline container composed in, a nested container,
+   * a slot's value), move the line composed in, or take a text node out of
+   * the container composed in. Writing it anew from what the editor shows
+   * would delete what the hold keeps back (the old shared node's delete
+   * takes its items with it), or leave it behind. Such a write is refused
+   * before it changes anything (see YBinding#$runWriter): the editor reads
+   * the document again, the local change undone. Removing the node composed
+   * in is refused too: what the update did with its text (removed it, or
+   * merged it into another node) is not told apart; the user removes it
+   * again once the composition ends.
+   */
+  $endangersHeld(): boolean {
+    const hidden = this.state.hidden;
+    if (hidden === null) {
+      return false;
+    }
+    for (const key of this.endangeredKeys(hidden)) {
+      if (this.$relocated(key)) {
+        return true;
+      }
+    }
+    const owner = $getNodeByKey(hidden.ownerKey);
+    const ownerAttached = owner !== null && owner.isAttached();
+    if (ownerAttached && this.$relocated(hidden.ownerKey)) {
+      return true;
+    }
+    const container = this.state.csByKey.get(hidden.ownerKey);
+    if (!ownerAttached || container === undefined || container.kind !== 'i') {
+      // (Text a write takes out of a line leaves the held items where they
+      // are, see Cursor#counts: a line has no shared node.)
+      return false;
+    }
+    // A text node taken out of the container composed in, which stays, into
+    // a node that was there before (a line split, Enter, makes the node its
+    // text goes to, and keeps its held items where they are, see
+    // Hidden#starts).
+    return this.$ownerTextKeys(hidden.ownerKey).some(key => {
+      const n = $getNodeByKey(key);
+      const parent = n === null ? null : n.getParent();
+      return (
+        n !== null &&
+        parent !== null &&
+        n.isAttached() &&
+        !n.getParents().some(p => p.getKey() === hidden.ownerKey) &&
+        this.$relocated(key) &&
+        this.prevState.read(() => {
+          const p = $getNodeByKey(parent.getKey());
+          return p !== null && p.isAttached();
+        })
+      );
+    });
+  }
+
+  /**
+   * The text nodes and line breaks node `key` held before this update, in
+   * document order.
+   */
+  private $ownerTextKeys(key: NodeKey): NodeKey[] {
+    return this.prevState.read(() => {
+      const out: NodeKey[] = [];
+      const walk = (el: ElementNode) => {
+        for (const child of el.getChildren()) {
+          if ($isLineBreakNode(child) || $isTextNode(child)) {
+            out.push(child.getKey());
+          } else if ($isElementNode(child)) {
+            walk(child);
+          }
+        }
+      };
+      const owner = $getNodeByKey(key);
+      if ($isElementNode(owner)) {
+        walk(owner);
+      }
+      return out;
+    });
+  }
+
+  /**
+   * The keys of the nodes stored as shared nodes around what `hidden` holds
+   * (an inline container composed in, a nested container, a slot): deleting
+   * one deletes the held items in it. (A line has no shared node of its own:
+   * a write that takes it apart leaves the held items where they are, see
+   * Cursor#counts, and the hold ends where they leave it.)
+   */
+  private endangeredKeys(hidden: Hidden): Set<NodeKey> {
+    const keys = new Set<NodeKey>();
+    const root = this.state.root;
+    const note = (item: Item) => {
+      for (
+        let y: YNode | null = item.parent as YNode;
+        y !== null && y !== root;
+        y = y._item === null ? null : (y._item.parent as YNode)
+      ) {
+        const key = this.state.keyByY.get(y);
+        if (key !== undefined) {
+          keys.add(key);
+        }
+      }
+    };
+    const doc = this.tr.doc;
+    hidden.forEachRange((client, start, end) => {
+      const structs = doc.store.clients.get(client);
+      if (structs === undefined) {
+        return;
+      }
+      for (
+        let i = findIndexSS(structs, start);
+        i < structs.length && structs[i].id.clock < end;
+        i++
+      ) {
+        const it = structs[i];
+        if (it instanceof Item && it.parent instanceof YNode) {
+          note(it);
+        }
+      }
+    });
+    for (const it of hidden.keptItems()) {
+      if (it.parent instanceof YNode) {
+        note(it);
+      }
+    }
+    return keys;
+  }
+
+  /**
+   * Whether this update moves node `key` or one of its ancestors (another
+   * parent, or another place among the siblings it had before and still
+   * has), or removes it.
+   */
+  private $relocated(key: NodeKey): boolean {
+    // Per level from the node up: its key and its siblings' keys.
+    const places = (): [NodeKey, NodeKey[]][] | null => {
+      const node = $getNodeByKey(key);
+      if (node === null || !node.isAttached()) {
+        return null;
+      }
+      const out: [NodeKey, NodeKey[]][] = [];
+      for (
+        let n: LexicalNode | null = node;
+        n !== null && n.getParent() !== null;
+        n = n.getParent()
+      ) {
+        out.push([
+          n.getKey(),
+          n
+            .getParentOrThrow()
+            .getChildren()
+            .map(c => c.getKey()),
+        ]);
+      }
+      return out;
+    };
+    const before = this.prevState.read(places);
+    if (before === null) {
+      return false;
+    }
+    const now = places();
+    if (now === null || now.length !== before.length) {
+      return true;
+    }
+    const stable = (list: NodeKey[], other: NodeKey[], k: NodeKey) =>
+      list.filter(c => c === k || other.includes(c)).indexOf(k);
+    for (let level = 0; level < now.length; level++) {
+      const [k, siblings] = now[level];
+      const [kb, siblingsBefore] = before[level];
+      if (
+        k !== kb ||
+        stable(siblings, siblingsBefore, k) !==
+          stable(siblingsBefore, siblings, k)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * After the write, while a composition's hold is on: no item the hold hides
+   * was deleted by this write, but where it deleted the node composed in
+   * with its text (I4, see $endangersHeld). Where one
+   * was, the hold ends (the editor reads what is stored), and development
+   * builds warn: a collaborator's text was lost without the composer seeing
+   * it.
+   */
+  private checkHeldKept(): void {
+    const hidden = this.state.hidden;
+    if (hidden === null) {
+      return;
+    }
+    const doc = this.tr.doc;
+    let lost = false;
+    hidden.forEachRange((client, start, end) => {
+      const structs = doc.store.clients.get(client);
+      if (lost || structs === undefined) {
+        return;
+      }
+      for (
+        let i = findIndexSS(structs, start);
+        i < structs.length && structs[i].id.clock < end;
+        i++
+      ) {
+        const it = structs[i];
+        if (
+          it instanceof Item &&
+          it.deleted &&
+          this.tr.deleteSet.hasId(it.id)
+        ) {
+          lost = true;
+          return;
+        }
+      }
+    });
+    if (!lost) {
+      return;
+    }
+    // The node composed in deleted with its text: its held items go with it.
+    const owner = $getNodeByKey(hidden.ownerKey);
+    const textKept =
+      (owner !== null && owner.isAttached()) ||
+      this.$ownerTextKeys(hidden.ownerKey).some(key => {
+        const text = $getNodeByKey(key);
+        return text !== null && text.isAttached();
+      });
+    hidden.missed = true;
+    if (__DEV__ && textKept) {
+      console.warn(
+        '@lexical/y: a write deleted text a collaborator wrote while a composition held it back; the hold ends.',
+      );
+    }
+  }
+
   $fillNode(y: YNode, node: LexicalNode): void {
     const key = node.getKey();
     const holes: string[] = [];
